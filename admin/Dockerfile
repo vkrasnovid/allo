@@ -1,13 +1,26 @@
-FROM python:3.12-slim
+FROM node:20-alpine AS base
 
 WORKDIR /app
 
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e ".[dev]"
+# Install dependencies
+COPY package.json package-lock.json ./
+RUN npm ci --only=production
 
+# Build the app
 COPY . .
+RUN npm run build
 
-ENV PYTHONPATH=/app
-EXPOSE 8004
+# Production image
+FROM node:20-alpine AS runner
+WORKDIR /app
 
-CMD ["uvicorn", "admin.src.main:app", "--host", "0.0.0.0", "--port", "8004"]
+ENV NODE_ENV=production
+
+COPY --from=base /app/public ./public
+COPY --from=base /app/.next/standalone ./
+COPY --from=base /app/.next/static ./.next/static
+
+EXPOSE 3000
+
+ENV PORT=3000
+CMD ["node", "server.js"]

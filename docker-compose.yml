@@ -1,10 +1,11 @@
 version: "3.9"
 
 x-logging: &default-logging
-  driver: "json-file"
-  options:
-    max-size: "10m"
-    max-file: "3"
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 x-restart: &default-restart
   restart: unless-stopped
@@ -149,7 +150,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://allo:${DB_PASSWORD:-allo_dev_pass}@postgres/allo
       BOOKING_API_URL: http://booking:8003/api/v1
-      PORT: 8004
+      PORT: 3000
     networks:
       - internal
     <<: [*default-restart, *default-logging]
