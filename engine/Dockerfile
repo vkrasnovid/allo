@@ -2,12 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e .[dev]
+# Copy engine package
+COPY engine/pyproject.toml /app/
+RUN pip install --no-cache-dir -e /app
 
-COPY src/ src/
-
-RUN mkdir -p /app/shared && ln -sf /opt/allo/shared /app/shared 2>/dev/null || true
+# Copy source code and shared library
+COPY engine/src/ /app/src/
+COPY shared/ /app/shared/
+ENV PYTHONPATH=/app
 
 EXPOSE 8002
 

@@ -2,12 +2,14 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e ".[dev]"
+# Copy speech package
+COPY speech/pyproject.toml /app/
+RUN pip install --no-cache-dir -e /app
 
-COPY . .
+# Copy source code
+COPY speech/ /app/
 
 ENV PYTHONPATH=/app
 EXPOSE 8001
 
-CMD ["uvicorn", "speech.src.main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8001"]

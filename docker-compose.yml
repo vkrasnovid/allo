@@ -27,8 +27,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    ports:
-      - "5432:5432"
     <<: [*default-restart, *default-logging]
 
   redis:
@@ -43,8 +41,6 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
-    ports:
-      - "6379:6379"
     <<: *default-restart
 
   minio:
@@ -70,8 +66,8 @@ services:
   # ===== Booking & CRM (Layer 4) =====
   booking:
     build:
-      context: ./booking
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: booking/Dockerfile
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -89,8 +85,8 @@ services:
   # ===== Conversational Engine (Layer 3) =====
   engine:
     build:
-      context: ./engine
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: engine/Dockerfile
     depends_on:
       redis: { condition: service_healthy }
       booking: { condition: service_started }
@@ -108,8 +104,8 @@ services:
   # ===== Voice Gateway (Layer 1) =====
   gateway:
     build:
-      context: ./gateway
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: gateway/Dockerfile
     depends_on:
       redis: { condition: service_healthy }
       postgres: { condition: service_healthy }
@@ -127,8 +123,8 @@ services:
   # ===== Speech Services (Layer 2) =====
   speech:
     build:
-      context: ./speech
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: speech/Dockerfile
     depends_on:
       - redis
     environment:
@@ -142,8 +138,8 @@ services:
   # ===== Admin Panel (Layer 5) =====
   admin:
     build:
-      context: ./admin
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: admin/Dockerfile
     depends_on:
       - postgres
       - booking
@@ -158,8 +154,8 @@ services:
   # ===== Notifications (Layer 5) =====
   notifications:
     build:
-      context: ./notifications
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: notifications/Dockerfile
     depends_on:
       - redis
       - postgres
