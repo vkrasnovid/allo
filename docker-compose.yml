@@ -1,0 +1,181 @@
+version: "3.9"
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-restart: &default-restart
+  restart: unless-stopped
+
+services:
+  # ===== Databases =====
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: allo
+      POSTGRES_USER: allo
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-allo_dev_pass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U allo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+    <<: [*default-restart, *default-logging]
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD:-allo_redis_pass}
+    volumes:
+      - redisdata:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    ports:
+      - "6379:6379"
+    <<: *default-restart
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-allo_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-allo_minio_pass}
+    volumes:
+      - miniodata:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    <<: [*default-restart, *default-logging]
+
+  # ===== Booking & CRM (Layer 4) =====
+  booking:
+    build:
+      context: ./booking
+      dockerfile: Dockerfile
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgresql+asyncpg://allo:${DB_PASSWORD:-allo_dev_pass}@postgres/allo
+      REDIS_URL: redis://:${REDIS_PASSWORD:-allo_redis_pass}@redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-allo_admin}
+      S3_SECRET_KEY: ${MINIO_PASSWORD:-allo_minio_pass}
+      PORT: 8003
+    networks:
+      - internal
+    <<: [*default-restart, *default-logging]
+
+  # ===== Conversational Engine (Layer 3) =====
+  engine:
+    build:
+      context: ./engine
+      dockerfile: Dockerfile
+    depends_on:
+      redis: { condition: service_healthy }
+      booking: { condition: service_started }
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:-allo_redis_pass}@redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://allo:${DB_PASSWORD:-allo_dev_pass}@postgres/allo
+      BOOKING_API_URL: http://booking:8003/api/v1
+      OPENCLAW_API_URL: http://openclaw:4000
+      OPENCLAW_API_KEY: ${OPENCLAW_API_KEY:-test_openclaw_key}
+      PORT: 8002
+    networks:
+      - internal
+    <<: [*default-restart, *default-logging]
+
+  # ===== Voice Gateway (Layer 1) =====
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgresql+asyncpg://allo:${DB_PASSWORD:-allo_dev_pass}@postgres/allo
+      REDIS_URL: redis://:${REDIS_PASSWORD:-allo_redis_pass}@redis:6379/0
+      SPEECH_ASR_URL: ws://speech:8001/ws/asr
+      SPEECH_VAD_URL: ws://speech:8001/ws/vad
+      ENGINE_URL: ws://engine:8002/ws/dialog
+      PORT: 8000
+    networks:
+      - internal
+    <<: [*default-restart, *default-logging]
+
+  # ===== Speech Services (Layer 2) =====
+  speech:
+    build:
+      context: ./speech
+      dockerfile: Dockerfile
+    depends_on:
+      - redis
+    environment:
+      YANDEX_API_KEY: ${YANDEX_SPEECHKIT_KEY:-}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-allo_redis_pass}@redis:6379/0
+      PORT: 8001
+    networks:
+      - internal
+    <<: [*default-restart, *default-logging]
+
+  # ===== Admin Panel (Layer 5) =====
+  admin:
+    build:
+      context: ./admin
+      dockerfile: Dockerfile
+    depends_on:
+      - postgres
+      - booking
+    environment:
+      DATABASE_URL: postgresql+asyncpg://allo:${DB_PASSWORD:-allo_dev_pass}@postgres/allo
+      BOOKING_API_URL: http://booking:8003/api/v1
+      PORT: 8004
+    networks:
+      - internal
+    <<: [*default-restart, *default-logging]
+
+  # ===== Notifications (Layer 5) =====
+  notifications:
+    build:
+      context: ./notifications
+      dockerfile: Dockerfile
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      DATABASE_URL: postgresql+asyncpg://allo:${DB_PASSWORD:-allo_dev_pass}@postgres/allo
+      REDIS_URL: redis://:${REDIS_PASSWORD:-allo_redis_pass}@redis:6379/0
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      PORT: 8005
+    networks:
+      - internal
+    <<: [*default-restart, *default-logging]
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

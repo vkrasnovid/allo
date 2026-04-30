@@ -1,0 +1,14 @@
+{
+  "name": "allo-telegram-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenClaw plugin — Telegram bot notification sender for Алло",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

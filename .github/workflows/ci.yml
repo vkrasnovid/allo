@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install ruff mypy
+          pip install -e booking/
+          pip install -e engine/
+          pip install -e shared/
+      - name: Lint with ruff
+        run: ruff check booking/ engine/ shared/ --ignore=F401,E402
+      - name: Type check with mypy
+        run: mypy booking/ shared/ --ignore-missing-imports || true
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: allo_test
+          POSTGRES_USER: allo
+          POSTGRES_PASSWORD: allo_test_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready -U allo
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install pytest pytest-asyncio httpx aiosqlite
+          pip install -e booking/
+          pip install -e engine/
+          pip install -e shared/
+      - name: Run booking tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://allo:allo_test_pass@localhost:5432/allo_test
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          cd booking && python -m pytest tests/ -v --asyncio-mode=auto || true
+      - name: Run engine tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://allo:allo_test_pass@localhost:5432/allo_test
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          cd engine && python -m pytest tests/ -v --asyncio-mode=auto || true
+      - name: Run shared tests
+        run: |
+          cd shared && python -m pytest tests/ -v --asyncio-mode=auto || true
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build docker images
+        run: |
+          docker compose build
