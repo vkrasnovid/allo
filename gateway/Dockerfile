@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir fastapi>=0.115.0 uvicorn[standard]>=0.30.0 sqlalc
 
 # Copy source code
 COPY gateway/ ./
+COPY shared/ /app/shared/
 
 ENV PYTHONPATH=/app
 
