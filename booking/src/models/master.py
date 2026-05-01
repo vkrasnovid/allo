@@ -2,7 +2,7 @@
 
 import uuid
 
-from sqlalchemy import Boolean, String, UniqueConstraint
+from sqlalchemy import Boolean, ForeignKey, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -18,7 +18,7 @@ class MasterORM(Base, TimestampMixin):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
     )
     yclients_id: Mapped[int | None] = mapped_column()
     name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -41,10 +41,10 @@ class MasterServiceORM(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     master_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("masters.id", ondelete="CASCADE"), nullable=False, index=True
     )
     service_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("services.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
     __table_args__ = (

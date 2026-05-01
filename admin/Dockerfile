@@ -2,12 +2,12 @@ FROM node:20-alpine AS base
 
 WORKDIR /app
 
-# Install dependencies
-COPY package.json package-lock.json ./
-RUN npm ci --only=production
+# Install dependencies (from admin subdir)
+COPY admin/package.json admin/package-lock.json ./
+RUN npm ci --omit=dev
 
 # Build the app
-COPY . .
+COPY admin/ .
 RUN npm run build
 
 # Production image

@@ -1,0 +1,90 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DOCKER_COMPOSE_VERSION: v2.27.0
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency: allo-deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Docker Compose
+        run: |
+          sudo curl -SL "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-linux-x86_64" -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+
+      - name: Build images
+        run: docker compose build
+
+      - name: Deploy to VPS
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          # Save SSH key
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          # Create project dir and copy files over SSH
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key \
+            ${SSH_USER}@${SSH_HOST} "mkdir -p /opt/allo && mkdir -p /opt/allo/infra/postgres"
+
+          # Copy docker-compose.yml and infra files
+          scp -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key \
+            docker-compose.yml ${SSH_USER}@${SSH_HOST}:/opt/allo/
+
+          # Deploy using docker compose pull + up
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/deploy_key \
+            ${SSH_USER}@${SSH_HOST} \
+            "cd /opt/allo && \
+             echo 'DB_PASSWORD=${secrets.DB_PASSWORD}' > .env && \
+             echo 'REDIS_PASSWORD=${secrets.REDIS_PASSWORD}' >> .env && \
+             echo 'MINIO_ROOT_USER=${secrets.MINIO_ROOT_USER}' >> .env && \
+             echo 'MINIO_PASSWORD=${secrets.MINIO_PASSWORD}' >> .env && \
+             echo 'YANDEX_SPEECHKIT_KEY=${secrets.YANDEX_SPEECHKIT_KEY}' >> .env && \
+             echo 'OPENCLAW_API_KEY=${secrets.OPENCLAW_API_KEY}' >> .env && \
+             echo 'SIPUNI_API_KEY=${secrets.SIPUNI_API_KEY}' >> .env && \
+             echo 'SIPUNI_ACCOUNT=${secrets.SIPUNI_ACCOUNT}' >> .env && \
+             echo 'SIPUNI_SECRET=${secrets.SIPUNI_SECRET}' >> .env && \
+             echo 'TELEGRAM_BOT_TOKEN=${secrets.TELEGRAM_BOT_TOKEN}' >> .env && \
+             echo 'JWT_SECRET=${secrets.JWT_SECRET}' >> .env && \
+             echo 'ENCRYPTION_KEY=${secrets.ENCRYPTION_KEY}' >> .env && \
+             docker compose pull && \
+             docker compose up -d && \
+             sleep 10"
+
+      - name: Health check
+        run: |
+          sleep 15
+          SERVICES="gateway:8000/health engine:8002/health notifications:8005/health"
+          for svc in $SERVICES; do
+            NAME="${svc%%:*}"
+            URL="http://localhost:${svc#*:}"
+            echo "Checking $NAME at $URL"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ $NAME is healthy (HTTP $STATUS)"
+            else
+              echo "❌ $NAME returned HTTP $STATUS"
+            fi
+          done
+
+      - name: Notify
+        if: always()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            🚀 Алло Deployment ${{ job.status }}
+            Commit: ${{ github.sha }}
+            Status: ${{ job.status }}

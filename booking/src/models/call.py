@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, Integer, JSON, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -26,11 +26,11 @@ class CallORM(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
     )
     caller_phone: Mapped[str] = mapped_column(String(20), nullable=False)
     client_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), index=True
+        UUID(as_uuid=True), ForeignKey("clients.id", ondelete="SET NULL"), index=True
     )
     did: Mapped[str] = mapped_column(String(20), nullable=False)
     session_id: Mapped[str | None] = mapped_column(String(255))
@@ -68,7 +68,7 @@ class CallTranscriptORM(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     call_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("calls.id", ondelete="CASCADE"), nullable=False, index=True
     )
     speaker: Mapped[str] = mapped_column(
         String(10), nullable=False,
@@ -93,10 +93,10 @@ class CallBookingORM(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     call_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("calls.id", ondelete="CASCADE"), nullable=False, index=True
     )
     booking_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("bookings.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
     __table_args__ = (

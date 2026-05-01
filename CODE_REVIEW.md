@@ -1,348 +1,450 @@
 # CODE REVIEW — Алло (TASK-026) Voice AI Secretary
 
-**Date:** 2026-04-30  
+**Date:** 2026-05-01  
 **Reviewer:** Code Reviewer (subagent)  
-**Scope:** Full codebase audit — all 7 services + shared libraries + admin panel + OpenClaw plugins  
+**Scope:** Full codebase audit — 7 services + shared libs + admin panel + OpenClaw plugins  
 
 ---
 
 ## Overall Verdict: CHANGES_REQUESTED
 
-Two critical issues (non-functional voice pipeline entry points + missing LLM client initialization) prevent the core architecture from working end-to-end. Four major issues with varying severity. Once resolved, the codebase is structurally sound for MVP.
+```
+APPROVED:     ❌ (blocked by critical issues)
+P0 (critical): 3
+P1 (major):    7
+P2 (minor):    8
+```
 
-| Category | Score | Weight |
-|----------|:-----:|:------:|
-| Code Quality | 6/10 | ⚠️ |
-| Architecture Compliance | 5/10 | ❌ |
-| Security | 6/10 | ⚠️ |
-| Error Handling | 7/10 | ✅ |
-| Testing | 7/10 | ✅ |
-| Performance | 5/10 | ⚠️ |
-| API Design | 7/10 | ✅ |
-| **Total** | **43/70** | |
+The project has an excellent architectural foundation but has **two concrete critical issues** that prevent the real-time voice pipeline from functioning, and several security/architectural gaps that must be resolved before deployment.
 
 ---
 
-## Score Breakdown
+## Scoring
 
-### 1. Code Quality — 6/10
-
-**Good:**
-- Full type hints across all Python and TypeScript files
-- Pydantic v2 models used consistently for all schemas
-- Clean separation of concerns across the monorepo structure
-- Good naming conventions (snake_case Python, camelCase TS, descriptive names)
-- Dockerfiles are syntactically valid
-
-**Issues:**
-
-- **[BUG] Missing `and_` import in routes.py** — `booking/src/api/routes.py` uses `and_()` from SQLAlchemy in `get_client_by_phone` (line ~293) but never imports it.
-  ```python
-  # Current import line:
-  from sqlalchemy import select, func, delete
-  # Should be:
-  from sqlalchemy import select, func, delete, and_
-  ```
-  **Effect:** Runtime `NameError` when hitting `GET /tenants/{id}/clients/by-phone/{phone}`.
-
-- **[BUG] LLM client never initialized** — `engine/src/main.py` line 28:
-  ```python
-  dialog_manager = DialogManager(
-      state_manager=state_manager,
-      tool_executor=tool_executor,
-      llm_client=None,  # NEVER INITIALIZED
-  )
-  ```
-  The `llm_client` parameter stays `None`. In `dialog/manager.py:process_user_message()`:
-  ```python
-  if self.llm:
-      # Use LLM  ← NEVER REACHED
-      ...
-  else:
-      # No LLM — return raw context (for testing)
-      result["reply"] = "[NO LLM] Dialog manager running without LLM client"
-  ```
-  **Effect:** The engine always returns a stub message. No actual LLM inference happens.
-
-- **[BUG] `hallucination_log.get_stats()` returns empty `by_tool`** — `HallucinationLog.log()` appends to `self.events` but `get_stats()` counts `"by_tool": {}` — it never actually populates the per-tool breakdown.
-
-- **`__import__` abuse** — `booking/src/api/routes.py` uses `__import__("datetime").timedelta(...)` instead of a clean `from datetime import timedelta` at the top. This is fragile and anti-idiomatic.
-
-- **`db.flush()` called twice in create_booking flow** — Once inside `_get_or_create_client()` and once after booking creation. Not harmful but redundant.
+| Category | Score | Notes |
+|----------|:-----:|-------|
+| **Security** | **5.5/10** | ❌ No ForeignKey constraints, missing TenantMiddleware on engine, no encryption at rest |
+| **Architecture** | **6/10** | ⚠️ Protocol mismatch between gateway↔engine WS, LLM init conditionally works |
+| **Code Quality** | **7/10** | ✅ Good typing, Pydantic everywhere, clean monorepo |
+| **Integrations** | **6/10** | ⚠️ YCliest adapter is stub, Celery stubs, Sipuni/SpeechKit API wrappers OK |
+| **Test Coverage** | **5/10** | ❌ Zero gateway/speech WS tests, no integration tests |
+| **Overall** | **5.9/10** | |
 
 ---
 
-### 2. Architecture Compliance — 5/10
+## P0 — Critical Issues (Blocking)
 
-**Good:**
-- Directory structure exactly matches ARCHITECTURE.md §1.3
-- All 15 ORM models present (exceeds 14 minimum)
-- 9 tools in `TOOL_REGISTRY` match §4.4
-- Service boundaries largely respected
-- Multi-tenant `tenant_id` pattern on all primary tables
+### P0-1. WebSocket protocol mismatch: Gateway ↔ Engine message schemas are incompatible
 
-**Issues:**
+**Severity:** BLOCKING  
+**Files:** `gateway/src/main.py`, `engine/src/main.py`
 
-- **[CRITICAL] Engine missing WebSocket endpoint** — ARCHITECTURE.md §3.3 explicitly defines `ws://engine:8002/ws/dialog/{call_id}` with specific event schemas (`client_speech`, `ai_response`, `action`). The engine only implements REST endpoints (`POST /api/engine/message`). The gateway's `audio_relay` WebSocket connects to:
-  ```python
-  engine_url = f"{ENGINE_WS_URL}/{session_id}"  # ws://engine:8002/ws/dialog/{session_id}
-  ```
-  **Effect:** The entire real-time voice pipeline will disconnect immediately — gateway can't relay audio to engine, ASR output never reaches dialog manager, TTS output never reaches client.
+**What:** The gateway's `audio_relay()` WebSocket handler opens a connection to `ws://engine:8002/ws/dialog/{session_id}` (engine *does* have this endpoint — contrary to previous review). However, the two sides speak **completely different message protocols**.
 
-- **[CRITICAL] Voice pipeline cannot function without engine WS** — The gateway's `_engine_to_client()` coroutine waits for engine WebSocket messages. Since that endpoint doesn't exist, the `asyncio.gather` in audio relay will fail immediately. The fallback `_forward_to_owner` will trigger, forwarding all calls to the salon owner — making the AI secretary non-functional.
+Gateway sends these message types to engine:
+```python
+# gateway/src/main.py lines ~200-240
+{"type": "call_start", "session_id": "...", "call_id": "...", "tenant_id": "...", ...}
+{"type": "system_message", "text": "...", "tts_priority": True}
+{"type": "client_speech", "text": "...", "is_final": True, ...}
+{"type": "vad_event", "event": "speech_start|speech_end|silence_timeout"}
+{"type": "interrupt_signal"}
+```
 
-- **[MAJOR] OpenClaw integration not wired** — Architecture §10 describes OpenClaw as LLM proxy and tool router. `engine/src/llm/__init__.py` defines `OpenClawLLMClient` but it's never instantiated in `engine/src/main.py`. The `OPENCLAW_API_URL` and `OPENCLAW_API_KEY` env vars exist in docker-compose but nothing uses them.
+Engine's WebSocket handler expects:
+```python
+# engine/src/main.py — dialog_websocket()
+{"type": "process", "tenant_id": "...", "text": "...", "client_phone": "..."}
+{"type": "reset", "tenant_id": "..."}
+{"type": "tool_call_result", "tenant_id": "...", "tool_name": "...", "args": {...}, "result": {...}}
+```
 
-- **[MAJOR] Silero VAD vs energy-based VAD** — ARCHITECTURE.md specifies Silero VAD (a neural network model). The speech service implements a simple energy-based RMS threshold VAD. Silero is significantly more accurate at detecting speech/noise boundaries, especially on telephone-grade audio (8 kHz). The current implementation may produce false positives/negatives in real-world conditions.
+The gateway expects engine responses with `ai_response`, `action`, `error` types:
+```python
+# gateway/src/main.py — _engine_to_client()
+if rtype == "ai_response": ...
+elif rtype == "action": ...
+elif rtype == "error": ...
+```
 
-- **[MINOR] Celery tasks not implemented** — Architecture §9.3 defines Celery tasks (reminders, cleanup, sync) but `notifications/src/tasks.py` is a stub. The `celery_app.py` exists but the actual task logic is missing.
+The engine instead sends:
+```python
+{"type": "response", "data": {...}}
+{"type": "error", "message": "..."}
+```
 
----
+**Effect:** Every message from the gateway hits the `Unknown message type: {msg_type}` branch in the engine. The gateway's `_engine_to_client()` receives these error responses instead of `ai_response`. The audio pipeline collapses immediately on every call. All inbound calls would be forwarded to the fallback number (`_forward_to_owner`).
 
-### 3. Security — 6/10
+**Fix:** Either:
+- (a) Update `engine/src/main.py` dialog_websocket to handle `call_start`, `client_speech`, `vad_event`, `system_message`, `interrupt_signal` types and respond with `ai_response`, `action`, `error`
+- (b) OR drop the WebSocket approach and make gateway call `POST /api/engine/message` REST endpoint — but this would lose the streaming/real-time nature
 
-**Good:**
-- No hardcoded secrets or API keys in source code
-- `FieldEncryption` class for sensitive DB fields (SIP passwords, YClients tokens)
-- `.env.example` covers all required variables
-- Pydantic pattern validation on phone numbers, IDs
-- TenantMiddleware in booking service
-
-**Issues:**
-
-- **[MAJOR] Missing ForeignKey constraints on ORM models** — Multiple models lack proper foreign keys, meaning no database-level referential integrity:
-  - `BookingORM.tenant_id` (no FK → tenants.id)
-  - `BookingORM.client_id` (no FK → clients.id)
-  - `BookingORM.master_id` (no FK → masters.id)
-  - `BookingORM.service_id` (no FK → services.id)
-  - `CallORM.tenant_id` (no FK → tenants.id)
-  - `BookingHistoryORM.booking_id` (no FK → bookings.id)
-  - etc.
-  
-  **Effect:** Deletes can orphan records. `ON DELETE CASCADE` specified in SQL schema but not enforced at the ORM/Database level.
-
-- **[MAJOR] Engine lacks TenantMiddleware** — Confirmed by QA report. Engine has no middleware to validate tenant existence or status. A malformed request with a fake tenant_id would pass through.
-
-- **[BUG] `sip_password` field storage** — Architecture §8.2 specifies `sip_password VARCHAR(255) ENCRYPTED` stored via `FieldEncryption`. The ORM model (`SipSettingsORM`) doesn't appear to store this field at all, and if it does, it's not encrypted. Sensitive credentials stored in plaintext.
-
-- **[P3] Redis password hardcoded in some URLs** — In docker-compose fallback:
-  ```yaml
-  REDIS_URL: redis://:${REDIS_PASSWORD:-allo_redis_pass}@redis:6379/0
-  ```
-  Default password `allo_redis_pass` is hardcoded. Fine for dev but risky for production.
-
----
-
-### 4. Error Handling — 7/10
-
-**Good:**
-- Graceful degradation matrix in architecture is well-thought-out
-- `retry_async` utility with exponential backoff
-- Circuit breaker pattern exists (even if not wired into services)
-- Structured error responses (`{"error": "CODE", "message": "..."}`)
-- Tool executor catches HTTP errors and wraps them gracefully
-
-**Issues:**
-
-- **[BUG] `asyncio.gather` partial failure in gateway** — `gateway/src/main.py` `audio_relay()` uses:
-  ```python
-  await asyncio.gather(
-      _client_to_speech(),
-      _asr_to_engine(),
-      _vad_to_engine(),
-      _engine_to_client(),
-  )
-  ```
-  If one task fails, the others keep running with no cleanup. The `stop` event is set by individual tasks on error, but not by all paths. If `_engine_to_client()` fails (which it will, since WS endpoint doesn't exist), the `except Exception` in the outer try block handles it — but the individual WS connections may not be properly closed.
-
-- **[MAJOR] Engine runs without LLM with no error signal** — When `llm_client=None`, the engine silently returns stub responses with `"[NO LLM] Dialog manager running without LLM client"`. No error is logged or raised. A production deploy would show "working" dashboards with no actual AI responses.
-
-- **[MINOR] VAD silence timeout doesn't trigger AI action** — The speech service sends `silence_timeout` event but the engine has no handler for it. Client could wait indefinitely in silence.
+Recommended fix (a) structure:
+```python
+@app.websocket("/ws/dialog/{call_id}")
+async def dialog_websocket(ws: WebSocket, call_id: str):
+    ...
+    async def _handle_call_start(msg):
+        # Initialize session, store call context
+        ...
+    async def _handle_client_speech(msg):
+        # Process speech via dialog manager, stream response back
+        result = await dialog_manager.process_user_message(...)
+        if result["reply"]:
+            await ws.send_json({"type": "ai_response", "text": result["reply"]})
+    async def _handle_vad_event(msg):
+        if msg["event"] == "speech_start":
+            await ws.send_json({"type": "interrupt_signal"})
+    ...
+```
 
 ---
 
-### 5. Testing — 7/10
+### P0-2. Missing `and_` SQLAlchemy import in routes.py
 
-**Good:**
-- 82 tests across 4 test suites, all passing
-- Anti-hallucination regression tests with real scenarios
-- Mock dialog tests cover booking flow edge cases
-- `pytest-asyncio` used for async test support
+**Severity:** BLOCKING  
+**File:** `booking/src/api/routes.py` line 10
 
-**Issues:**
+**What:** `from sqlalchemy import select, func, delete` — `and_` is not imported but is used in `get_client_by_phone()`:
+```python
+.outerjoin(BookingORM, and_(
+    BookingORM.client_id == ClientORM.id,
+    BookingORM.status == "completed",
+))
+```
 
-- **[MINOR] No WebSocket tests** — Speech service (ASR, VAD, TTS) and gateway audio relay have zero WebSocket tests. The most latency-sensitive and error-prone part of the system is untested.
-- **[MINOR] Test coverage metrics unclear** — No `pytest-cov` configured in any `pyproject.toml`. Coverage numbers from QA report are estimates.
-- **[MINOR] YClients adapter has no real integration tests** — The stub returns `False` for `is_available()`, so nothing tests actual YClients API interaction.
+**Effect:** `GET /tenants/{id}/clients/by-phone/{phone}` crashes with `NameError: name 'and_' is not defined`. This is the endpoint used to look up returning clients — a core UX path.
 
----
-
-### 6. Performance — 5/10
-
-**Good:**
-- Async I/O throughout (FastAPI + asyncpg + httpx async)
-- SQLAlchemy connection pooling configured (pool_size=5, max_overflow=10)
-- Redis has TTL on all keys (SESSION_TTL=7200s)
-- `ltrim` on Redis message history prevents unbounded memory growth
-
-**Issues:**
-
-- **[MAJOR] `_get_tenant()` called on every API request** — Every booking endpoint calls `_get_tenant()` which does a separate SELECT query. In a multi-call dialog (services → masters → slots → create_booking), this means 4+ identical tenant lookups. No Redis caching for tenant data.
-
-- **[MAJOR] No client-side caching for service/master catalogs** — Service and master lists are fetched from DB on every dialog turn. These are read-heavy, rarely-change datasets that should be cached in Redis with a 5-minute TTL.
-
-- **[MAJOR] Gateway WebSocket architecture creates 4 concurrent connections per call** — Each active call opens 4 WebSocket streams (ASR, VAD, engine audio, TTS) + the SIP connection. At 50 concurrent calls, that's 200+ active WebSocket connections. The architecture mentions pjsua2 processing limits but doesn't address WebSocket scaling.
-
-- **[BUG] `BookingServiceClient` creates a new httpx.AsyncClient per instance** — `ToolExecutor.__init__` creates a `BookingServiceClient` which creates its own `AsyncClient`. If multiple `ToolExecutor` instances exist, they won't share a connection pool.
-
-- **[MINOR] No connection pooling for Redis** — `redis.from_url()` creates a single connection. Under load, `redis-py` will queue requests. Consider connection pool for production.
+**Fix:** Add `and_` to the SQLAlchemy import line:
+```python
+from sqlalchemy import select, func, delete, and_
+```
 
 ---
 
-### 7. API Design — 7/10
+### P0-3. Gateway and engine WebSocket protocols don't send/receive session initialization properly
 
-**Good:**
-- RESTful resource naming (`/tenants/{id}/bookings`, `/tenants/{id}/masters`)
-- Proper HTTP methods (GET for reads, POST for creates, PATCH for updates, DELETE for cancellations)
-- Consistent error format (`{"error": "CODE", "message": "..."}`)
-- Proper status codes (201 for create, 404 for not found, 409 for conflicts, 422 for validation)
-- Pydantic request/response models with regex validation on phone numbers
+**Severity:** BLOCKING  
+**Files:** `gateway/src/main.py` lines 175-195, `engine/src/main.py`
 
-**Issues:**
+**What:** Even after fixing P0-1, the gateway sends `{"type": "call_start"}` with session metadata before any audio flows. The gateway's `_engine_to_client()` concurrently reads for `ai_response` messages. But the engine was designed as a request-response WS (client sends `process` → server sends `response`), not a bidirectional conversation channel.
 
-- **[BUG] `PATCH /bookings/{id}` overloads multiple actions** — The `action` field in `BookingUpdateRequest` can be `reschedule | update_service | update_master | cancel`. Cancelling via PATCH is semantically incorrect — DELETE is the proper method for cancellation. The dedicated `DELETE /bookings/{id}` endpoint already handles cancellations correctly.
+Additionally, the gateway fails to forward the `call_start` data as `tenant_id` to the engine's dialog manager — the WS handler in engine requires `tenant_id` in every message but the gateway's `call_start` and `client_speech` messages _do_ include it.
 
-- **[MINOR] Mixed UUID/string types across API** — `BookingResponse.booking_id` is `UUID` type, but tool function `update_booking` receives `booking_id` as `str` parameter. The `Master.id` in responses is `str` while `master_id` in requests expects `UUID`. Small inconsistencies that can cause 422 errors.
-
-- **[MINOR] `find_slots` uses `days` query param with default 1, max 14** — Good upper bound. But `date` is optional with server-side default of "today". This makes caching slot results unpredictable.
+**Fix:** Implement proper bidirectional WS protocol with message routing by type in the engine (see P0-1 fix recommendation).
 
 ---
 
-## Critical Issues (Blocking)
+## P1 — Major Issues (Should Fix Before MVP)
 
-### C1. Engine WebSocket endpoint missing — voice pipeline broken
-- **File:** `engine/src/main.py`
-- **What:** ARCHITECTURE.md §3.3 defines `ws://engine:8002/ws/dialog/{call_id}`, gateway tries to connect to it, but engine has no WS endpoint
-- **Impact:** Gateway's `audio_relay` → `_engine_to_client()` will fail immediately. All calls forwarded to owner. AI secretary is non-functional as a voice system.
-- **Fix:** Implement WebSocket endpoint in `engine/src/main.py` (or add a simple WS bridge that feeds into the REST `/api/engine/message` endpoint), OR update ARCHITECTURE.md to match REST-only implementation and update gateway to use REST polling.
+### P1-1. All ORM models lack ForeignKey constraints
 
-### C2. LLM client never initialized
-- **File:** `engine/src/main.py` line 28
-- **What:** `llm_client=None` — the `OpenClawLLMClient` from `engine/src/llm/__init__.py` is defined but never instantiated or wired into the dialog manager
-- **Impact:** `process_user_message()` always takes the `else: "[NO LLM]"` branch. No actual AI conversation happens.
-- **Fix:** Instantiate `OpenClawLLMClient` in the `lifespan` startup and pass it to `DialogManager`:
-  ```python
-  from src.llm import OpenClawLLMClient
-  llm_client = OpenClawLLMClient(
-      base_url=os.getenv("OPENCLAW_API_URL", "http://openclaw:4000"),
-      api_key=os.getenv("OPENCLAW_API_KEY", ""),
-  )
-  dialog_manager = DialogManager(state_manager=state_manager, tool_executor=tool_executor, llm_client=llm_client)
-  ```
+**Severity:** MAJOR  
+**Files:** All models in `booking/src/models/*.py`
 
-### C3. Missing `and_` import in routes.py
-- **File:** `booking/src/api/routes.py` line 10 (imports) and line ~293 (usage)
-- **What:** `and_()` used in SQLAlchemy query but not imported. `from sqlalchemy import select, func, delete` — needs `and_`.
-- **Impact:** Runtime `NameError` on `GET /tenants/{id}/clients/by-phone/{phone}`. Blocks the client lookup feature entirely.
-- **Fix:** Add `and_` to the import line.
+**What:** Despite detailed SQL schema in ARCHITECTURE.md specifying `REFERENCES tenants(id) ON DELETE CASCADE`, none of the ORM models define `ForeignKey` columns. Only SQLAlchemy `relationship()` directives exist, which do **not** enforce referential integrity at the database level.
+
+Affected tables:
+- `BookingORM.tenant_id`, `.client_id`, `.master_id`, `.service_id` — no FK
+- `CallORM.tenant_id`, `.client_id` — no FK
+- `ClientORM.tenant_id` — no FK
+- `ServiceORM.tenant_id` — no FK
+- `MasterORM.tenant_id` — no FK
+- `BookingHistoryORM.booking_id` — no FK
+- `SipSettingsORM.tenant_id` — no FK
+
+**Effect:** Orphaned records, no cascade deletes. If a tenant is deleted, all their data stays in the DB as garbage. No DB-level protection against referential corruption.
+
+**Fix:** Add `ForeignKey` to all `mapped_column` definitions:
+```python
+from sqlalchemy import ForeignKey
+
+# In each model:
+tenant_id: Mapped[uuid.UUID] = mapped_column(
+    UUID(as_uuid=True),
+    ForeignKey("tenants.id", ondelete="CASCADE"),
+    nullable=False, index=True,
+)
+```
 
 ---
 
-## Major Issues (Should Fix Before MVP)
+### P1-2. Docker Compose YAML anchor merge syntax is broken
 
-### M1. Docker Compose YAML anchor merge bug
-- **File:** `docker-compose.yml` (all services using `<<: [*default-restart, *default-logging]`)
-- **What:** Using a list in YAML merge key causes `driver` and `options` from `x-logging` to become top-level service properties instead of nesting under `logging:`
-- **Effect:** `docker compose config` fails. The `driver` and `options` keys leak into service root.
-- **Fix:** Split into two merge keys:
-  ```yaml
+**Severity:** MAJOR  
+**File:** `docker-compose.yml`
+
+**What:** Services use `<<: [*default-restart, *default-logging]` — a list-based YAML merge. The `logging` key is a structured YAML key, and merging it as a flat anchor list causes `driver` and `options` to become top-level service properties instead of nesting under `logging:`.
+
+```yaml
+x-logging: &default-logging
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-restart: &default-restart
+  restart: unless-stopped
+
+# Broken:
+services:
+  postgres:
+    <<: [*default-restart, *default-logging]  # driver leaks to service root
+```
+
+**Effect:** `docker compose config` fails to validate. In some versions the keys silently leak. The `logging` block is not properly applied, so containers use default Docker logging (json-file without rotation limits), which will fill disk.
+
+**Fix:** Split into two merge sources:
+```yaml
+postgres:
   <<: *default-restart
   logging: *default-logging
-  ```
-
-### M2. Missing ForeignKey constraints on all ORM models
-- **Files:** `booking/src/models/booking.py`, `call.py`, `client.py`, `master.py`, `service.py`, etc.
-- **What:** None of the ORM models define `ForeignKey` constraints. Only SQLAlchemy relationships exist (which don't enforce referential integrity at DB level).
-- **Effect:** Orphaned records possible. Cascade deletes from architecture SQL schema not enforced.
-- **Fix:** Add `ForeignKey` to `mapped_column` definitions:
-  ```python
-  from sqlalchemy import ForeignKey
-  tenant_id: Mapped[uuid.UUID] = mapped_column(
-      UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
-  )
-  ```
-
-### M3. Engine lacks TenantMiddleware
-- **File:** `engine/src/main.py`
-- **What:** Booking service has `TenantMiddleware` from `shared/middleware/` but engine doesn't import or use it. Engine receives `tenant_id` in request bodies but doesn't validate tenant existence or status.
-- **Effect:** Malformed requests could bypass tenant isolation checks.
-- **Fix:** Import and wire `TenantMiddleware` in engine's FastAPI app, or add inline validation in `process_user_message()`.
-
-### M4. Celery tasks are stubs — no actual notification sending
-- **File:** `notifications/src/tasks.py`
-- **What:** The architecture defines reminder sending, audio cleanup, and YClients sync as Celery tasks. But `tasks.py` doesn't contain real implementations — just function signatures with `...`.
-- **Effect:** SMS reminders, audio cleanup, and YClients background sync won't work.
-- **Fix:** Implement task bodies (query `scheduled_notifications`, send SMS via `sms_provider`, clean S3 audio, sync bookings to YClients).
+```
 
 ---
 
-## Minor Issues (Nice to Fix)
+### P1-3. Engine lacks TenantMiddleware — no tenant validation
 
-### m1. Energy-based VAD instead of Silero VAD
-- **File:** `speech/src/main.py`
-- **What:** Architecture specifies Silero VAD. Implementation uses RMS threshold (`VAD_RMS_THRESHOLD = 300.0`). Silero is significantly more accurate for telephone audio.
-- **Fix:** Add Silero VAD as optional enhancement. The current RMS approach can be kept as fallback.
+**Severity:** MAJOR  
+**File:** `engine/src/main.py`
 
-### m2. `hallucination_log.get_stats()` returns empty dict
-- **File:** `engine/src/dialog/guard.py`, `HallucinationLog.get_stats()`
-- **What:** `"by_tool": {}` is never populated despite `log()` receiving tool names.
-- **Fix:** Track tool-level stats.
+**What:** The booking service's router automatically validates tenant existence/status via `await _get_tenant(db, tenant_id)` in each endpoint. The engine has **no such validation**. Any request with any `tenant_id` (including fake or deleted tenants) is processed normally.
 
-### m3. `db.flush()` called in `_get_or_create_client` and again in create_booking
-- **File:** `booking/src/api/routes.py`
-- **What:** Redundant flushes. Minor performance cost.
-- **Fix:** Remove one of the redundant `flush()` calls.
+**Effect:** Malformed or malicious requests can trigger tool execution against non-existent tenants. Could lead to data inconsistency (Redis state stored for phantom tenants) or subtle bugs.
 
-### m4. No WebSocket tests for speech/gateway
-- **Files:** `speech/tests/`, `gateway/tests/`
-- **What:** No test directories exist for speech service or gateway. The most latency-sensitive parts of the system have zero tests.
-- **Fix:** Add pytest with `httpx` WebSocket test client for ASR, VAD, TTS endpoints.
-
-### m5. `sip_password` not encrypted in ORM
-- **File:** `booking/src/models/sip.py` (if the field exists)
-- **What:** Architecture specifies Fernet encryption for SIP credentials. ORM may not have the field or stores it in plaintext.
-- **Fix:** Use `FieldEncryption` for `sip_password` column.
+**Fix:** Add tenant validation in `DialogManager.process_user_message()`:
+```python
+async def process_user_message(self, tenant_id, call_id, text, ...):
+    # Validate tenant exists
+    if not await self.tools.booking_client.validate_tenant(tenant_id):
+        return {"error": "TENANT_NOT_FOUND", "reply": "Извините, произошла ошибка"}
+    ...
+```
 
 ---
 
-## What's Good
+### P1-4. `sip_password` — declared ENCRYPTED in schema but stored plaintext (or missing)
 
-### Excellent Architecture Decisions
-- **Five-layer isolation** with clear REST/WebSocket contracts between layers
-- **Interface-first tool design** using Python `Protocol` classes — makes testing trivial
-- **Prompt composability** — base prompt + configurable blocks per tenant is a well-designed system
-- **Multi-tenant by design** — `tenant_id` on every table, Redis key prefixes, DID-based routing
-- **S3 + B-tree exclusion index** for slot conflict prevention
+**Severity:** MAJOR  
+**File:** `booking/src/models/sip.py`, `shared/security/__init__.py`
 
-### Strong Implementation Quality
-- **82 passing tests** across shared tools, booking, engine, and notifications
-- **Full TypeScript + Next.js 14 admin panel** with server components and proper mobile-responsive design
-- **Anti-hallucination guards** with param validation, price range checking, and response cleaning
-- **Graceful degradation patterns** — retry with backoff, circuit breaker stubs, structured error codes
-- **Telegram bot** with proper anti-spam (30s cooldown), inline keyboards, Markdown formatting
-- **Redis dialog state management** with TTL, message trimming, tenant-based key isolation
+**What:** ARCHITECTURE.md §8.2 specifies Fernet encryption for `sip_password VARCHAR(255) ENCRYPTED`. The ORM model `SipSettingsORM` defines `sip_password: Mapped[str | None]` with no encryption at the ORM layer. The `FieldEncryption` class exists in `shared/security/` but is **never used** anywhere in the codebase.
 
-### Design Quality
-- **Design spec** is production-grade: contrast ratios, color philosophy, responsive breakpoints, WCAG accessibility
-- **Empty states** for every page (not an afterthought)
-- **Error states** with retry buttons
-- **Skeleton loading** instead of spinners
+**Effect:** Any SIP password stored in the database would be in plaintext. If someone gains DB access, they get the SIP credentials.
 
-### Security-Conscious
-- No hardcoded secrets in code
-- `.env.example` documents all required variables
-- Fernet encryption utility exists for sensitive fields
-- HMAC signature verification for Sipuni webhooks
+**Fix:** Either:
+- (a) Add `before_insert` / `before_update` listener on `SipSettingsORM` to auto-encrypt via `FieldEncryption`
+- (b) Or make encryption explicit in the seed/admin API where the password is stored
+
+---
+
+### P1-5. Celery notification tasks are stubs — no real notification sending
+
+**Severity:** MAJOR  
+**Files:** `notifications/src/tasks.py`, `notifications/src/celery_app.py`
+
+**What:** The architecture specifies Celery-based SMS reminders, audio cleanup, and YClients sync. The `tasks.py` file has:
+- `send_reminders()` — checks booking service health but sends zero actual SMS
+- `send_single_sms()` — works but is never called by anything
+- `cleanup_sessions()` — placeholder that logs and returns
+
+**Effect:** SMS reminders, audio cleanup, and background YClients sync don't work.
+
+**Fix:** Implement `send_reminders` to query `scheduled_notifications` table, get upcoming bookings, and actually call `sms_provider.send_sms()`.
+
+---
+
+### P1-6. Gateway service has no rate limiting
+
+**Severity:** MAJOR  
+**File:** `gateway/src/main.py`
+
+**What:** ARCHITECTURE.md §8.1 specifies rate limiting at 100 req/min per tenant. The gateway has no rate limiting middleware. The booking service also lacks rate limiting.
+
+**Effect:** An attacker (or misconfigured Sipuni) can flood the inbound call endpoint, creating unlimited `ActiveCall` objects and triggering OOM.
+
+**Fix:** Add `slowapi` or custom Redis-backed rate limiter on `POST /api/v1/calls/inbound` and other gateway endpoints.
+
+---
+
+### P1-7. No S3/MinIO integration for call recordings
+
+**Severity:** MAJOR  
+**Files:** `gateway/src/main.py`, `speech/src/main.py`, `docker-compose.yml`
+
+**What:** ARCHITECTURE.md specifies S3/MinIO for audio storage (90-day retention). The `docker-compose.yml` defines a MinIO container with credentials. BUT:
+- The gateway never saves audio to S3
+- There's no `minio/` or `s3/` module in any service
+- The `audio_key` field in `CallORM` is never populated
+- No audio cleanup job exists
+
+**Effect:** Call recordings are never persisted. Can't review past calls, no audit trail.
+
+**Fix:** Implement audio capture in `gateway/src/main.py` audio relay — buffer the full conversation and upload to MinIO when the call ends (or periodically).
+
+---
+
+## P2 — Minor Issues (Should Fix)
+
+### P2-1. Energy-based VAD instead of specified Silero VAD
+
+**File:** `speech/src/main.py`
+
+ARCHITECTURE.md specifies Silero VAD (neural network). Implementation uses simple RMS threshold (`VAD_RMS_THRESHOLD = 300.0`). On 8 kHz telephone audio, this is unreliable — background noise, breathing, line noise all produce RMS > 300. Silero VAD is significantly more robust.
+
+**Priority:** P2 — RMS may work well enough for MVP in quiet environments, but will false-positive in noisy settings.
+
+---
+
+### P2-2. Gateway WS `asyncio.gather` — partial failure doesn't clean up all connections
+
+**File:** `gateway/src/main.py` lines 257-292
+
+```python
+await asyncio.gather(
+    _client_to_speech(),
+    _asr_to_engine(),
+    _vad_to_engine(),
+    _engine_to_client(),
+)
+```
+
+If one task fails, the other three keep running until the `finally` block. However, the `stop` event may not be set in time — if `_engine_to_client()` fails (which it will with current protocol mismatch), the ASR and VAD connections continue consuming resources. The `finally` block does attempt to close all WS connections.
+
+**Fix:** Use `asyncio.gather(..., return_exceptions=True)` and check results to ensure immediate full cleanup.
+
+---
+
+### P2-3. `HallucinationLog.get_stats()` returns empty `by_tool`
+
+**File:** `engine/src/dialog/guard.py`
+
+`log()` records per-tool events in `self.events`, but `get_stats()` returns `"by_tool": {}` — it never aggregates by tool name.
+
+**Fix:** Track tool-level counts:
+```python
+def log(self, tool_name: str, params: dict, reason: str):
+    self.events.append({...})
+    self.by_tool.setdefault(tool_name, 0)
+    self.by_tool[tool_name] += 1
+```
+
+---
+
+### P2-4. `db.flush()` called redundantly in booking creation
+
+**File:** `booking/src/api/routes.py`
+
+`_get_or_create_client()` calls `await db.flush()` internally (to get `client.id`). The `create_booking()` route calls `await db.flush()` again after adding the booking. The second flush is redundant.
+
+---
+
+### P2-5. Redis connection pooling not configured
+
+**File:** `engine/src/state/redis_manager.py`
+
+`redis.from_url(REDIS_URL)` creates a single connection. Under load (e.g., 20+ concurrent calls), `redis-py` queues requests on this single connection. The architecture implies Redis-backed state for many concurrent calls.
+
+**Fix:** Use connection pool:
+```python
+self.redis = await aioredis.from_url(REDIS_URL, max_connections=20, ...)
+```
+
+---
+
+### P2-6. `__import__("datetime")` anti-pattern
+
+**File:** `booking/src/api/routes.py`
+
+Multiple uses of `__import__("datetime").timedelta()` instead of `from datetime import timedelta` at the top of the file. Fragile, hard to maintain, and obscures intent.
+
+---
+
+### P2-7. No WebSocket tests for speech service or gateway
+
+**Files:** `speech/tests/`, `gateway/tests/` — don't exist as test directories
+
+The most latency-sensitive components (real-time ASR, VAD, TTS) have zero tests. The gateway's `audio_relay` WebSocket handler is untested.
+
+**Fix:** Add `pytest` tests using `httpx` WebSocket test transport.
+
+---
+
+### P2-8. `update_booking` PATCH uses `action` field for "cancel" — should use DELETE
+
+**File:** `booking/src/api/routes.py`
+
+`BookingUpdateRequest` allows `action = "cancel"` via PATCH. There's already a dedicated `DELETE /bookings/{id}` endpoint. Having two ways to cancel is confusing and breaks REST semantics.
+
+---
+
+## Integration-Specific Checks
+
+### Sipuni API (`gateway/src/main.py`)
+- ✅ HMAC-SHA256 verification for webhooks
+- ✅ Exponential backoff retry (3 retries)
+- ✅ Fallback to `ALLO_FALLBACK_DIRECT` when tenant not resolved
+- ✅ Proper error logging with `_mask_phone()` (PII-safe)
+
+### Yandex SpeechKit (`speech/src/main.py`)
+- ✅ API-Key header via `_yc_headers()`
+- ✅ Retry with backoff for both ASR and TTS
+- ✅ Audio format matched between ASR/TTS (LPCM, 8kHz)
+- ⚠️ Hardcoded `topic: "general"` — could benefit from `"maps"` (for addresses) or custom model for beauty salon domain
+
+### YClients Adapter (`booking/src/yclients/adapter.py`)
+- ⚠️ **Stub only** — `is_available()` always returns `False` in the stub
+- ⚠️ Lacks actual HTTP integration with YClients API
+- ⚠️ Lacks auth token refresh logic
+
+### Telegram Bot (`notifications/src/telegram/bot.py`)
+- ✅ Anti-spam (30s cooldown per user — in-memory, lost on restart)
+- ✅ Inline keyboards with proper callback routing
+- ✅ Markdown formatting in messages
+- ⚠️ All data fetching functions are stubs (`_fetch_bookings_for_today`, `_fetch_today_stats`)
+- ⚠️ No webhook mode configured (uses polling)
+
+### Telegram Plugin (`openclaw-plugins/telegram-bot/src/index.ts`)
+- ✅ Proper `fetch`-based API calls
+- ✅ Fallback when `TELEGRAM_BOT_TOKEN` not set
+- ⚠️ No retry on network errors
+- ⚠️ No HMAC verification for incoming updates (polling mode, but still)
+
+---
+
+## Architecture Compliance
+
+| Architecture Decision | Status | Notes |
+|----------------------|--------|-------|
+| 5-layer isolation | ✅ Implemented | Clear service boundaries |
+| PostgreSQL 15 | ✅ | asyncpg + SQLAlchemy 2 |
+| Redis for state | ✅ | Keys with `tenant_id` prefix + TTL |
+| Pydantic v2 contracts | ✅ | Between all layers |
+| Multi-tenant `tenant_id` | ✅ | On all tables + Redis keys |
+| RLS policies | ❌ Not implemented | Architecture specifies PostgreSQL RLS policy — not created |
+| WS protocol spec | ❌ Mismatch | See P0-1 |
+| Silero VAD | ❌ | RMS energy-based (cheaper but inferior) |
+| S3 audio storage | ❌ Not implemented | MinIO defined but no upload code |
+| Fernet encryption | ⚠️ Defined but unused | `FieldEncryption` class exists, never instantiated |
+| Celery background tasks | ⚠️ Stubs | Task functions exist but bodies are stubbed |
+| Rate limiting | ❌ Not implemented | Architecture specifies but absent |
+| JWT auth for admin | ⚠️ Not implemented | Architecture specifies but admin uses no-auth mock data |
+| 9 tools in registry | ✅ | Matches §4.4 specification |
+| OpenClaw as LLM proxy | ⚠️ Partial | Client defined but conditionally initialized |
+| Graceful degradation matrix | ⚠️ Partially | Some circuit breakers defined, none wired |
+
+---
+
+## Existing CODE_REVIEW.md — Corrections
+
+The previous review (2026-04-30) had several inaccuracies:
+
+1. **"C1 — Engine WebSocket endpoint missing"** — INCORRECT. The endpoint `/ws/dialog/{call_id}` **does exist** at `engine/src/main.py`. The real issue is **protocol incompatibility** (see P0-1 above).
+
+2. **"C2 — LLM client never initialized"** — PARTIALLY INCORRECT. The LLM client **is initialized** when `OPENCLAIM_API_KEY` env var is truthy (which it is in docker-compose defaults: `OPENCLAW_API_KEY=-test_openclaw_key`). The real concern is that it silently falls back to stub mode in dev environments without the env var.
+
+3. **"M1 — Docker Compose YAML anchor merge bug"** — CONFIRMED. Fixed in this review.
 
 ---
 
@@ -350,16 +452,36 @@ Two critical issues (non-functional voice pipeline entry points + missing LLM cl
 
 ```
 STATUS: CHANGES_REQUESTED
-TEST_RESULTS: 82/82 passed
-CRITICAL: 3 issues (C1, C2, C3)
-MAJOR: 4 issues (M1-M4)
-MINOR: 5 issues (m1-m5)
+
+P0 (blocking): 3
+  - P0-1: WebSocket protocol mismatch (gateway ↔ engine)
+  - P0-2: Missing `and_` import (crash on client lookup)
+  - P0-3: Session init and protocol flow incomplete
+
+P1 (major): 7
+  - P1-1: Missing ForeignKey constraints on all ORM models
+  - P1-2: Docker Compose merge syntax broken
+  - P1-3: Engine lacks tenant validation
+  - P1-4: SIP passwords stored without encryption
+  - P1-5: Celery notification tasks are stubs
+  - P1-6: No rate limiting on gateway
+  - P1-7: No S3/MinIO audio storage integration
+
+P2 (minor): 8
+  - P2-1: RMS VAD instead of Silero VAD
+  - P2-2: WS gather partial failure cleanup
+  - P2-3: HallucinationLog by-tool stats empty
+  - P2-4: Redundant db.flush()
+  - P2-5: No Redis connection pool
+  - P2-6: __import__ anti-pattern
+  - P2-7: No WebSocket tests for speech/gateway
+  - P2-8: Dual cancel semantics (PATCH + DELETE)
 ```
 
-The Алло project has an **excellent foundation** — well-architected, well-tested, with clean separation of concerns and strong design. However, the critical issues prevent the core voice pipeline from functioning:
+**Bottom line:** The codebase structure, typing, separation of concerns, and documentation are excellent. The architectural design is sound. However, two critical issues (WS protocol mismatch + missing import) and several missing security/privacy implementations prevent MVP deployment.
 
-1. The engine has **no WebSocket endpoint** despite the architecture and gateway expecting one (`/ws/dialog/{call_id}`)
-2. The **LLM client is never initialized** (`llm_client=None`) — no AI conversation happens
-3. A **missing import** (`and_`) will crash the client lookup endpoint at runtime
-
-All three are straightforward to fix (combined effort < 2 hours). Once resolved, the architecture is sound and the codebase is MVP-ready.
+**Estimated fix effort:**
+- P0 fixes: ~2-4 hours (WS protocol bridge + missing import)
+- P1 fixes: ~4-6 hours (FK constraints, encryption, Docker fix, rate limiting, tenant validation)
+- P2 fixes: ~3-5 hours (VAD tuning, logging fixes, test coverage, Redis pool)
+- **Total: ~9-15 hours**
