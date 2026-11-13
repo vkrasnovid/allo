@@ -75,6 +75,8 @@ services:
       S3_ENDPOINT: http://minio:9000
       S3_ACCESS_KEY: ${MINIO_ROOT_USER:-allo_admin}
       S3_SECRET_KEY: ${MINIO_PASSWORD:-allo_minio_pass}
+      # Fernet-ключ для шифрования SIP-паролей (см. .env.example)
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required - see .env.example}
       PORT: 8003
     networks:
       - internal
@@ -93,7 +95,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://allo:${DB_PASSWORD:-allo_dev_pass}@postgres/allo
       BOOKING_API_URL: http://booking:8003/api/v1
       OPENCLAW_API_URL: http://openclaw:4000
-      OPENCLAW_API_KEY: ${OPENCLAW_API_KEY:-test_openclaw_key}
+      OPENCLAW_API_KEY: ${OPENCLAW_API_KEY:-}
       PORT: 8002
     networks:
       - internal
@@ -108,11 +110,16 @@ services:
       redis: { condition: service_healthy }
       postgres: { condition: service_healthy }
     environment:
-      DATABASE_URL: postgresql+asyncpg://allo:${DB_PASSWORD:-allo_dev_pass}@postgres/allo
+      BOOKING_API_URL: http://booking:8003/api/v1
       REDIS_URL: redis://:${REDIS_PASSWORD:-allo_redis_pass}@redis:6379/0
-      SPEECH_ASR_URL: ws://speech:8001/ws/asr
-      SPEECH_VAD_URL: ws://speech:8001/ws/vad
-      ENGINE_URL: ws://engine:8002/ws/dialog
+      # Имена переменных совпадают с gateway/src/main.py
+      SPEECH_WS_URL: ws://speech:8001
+      ENGINE_WS_URL: ws://engine:8002/ws/dialog
+      SIPUNI_API_KEY: ${SIPUNI_API_KEY:-}
+      SIPUNI_ACCOUNT: ${SIPUNI_ACCOUNT:-}
+      SIPUNI_SECRET: ${SIPUNI_SECRET:-}
+      ALLO_FALLBACK_DIRECT: ${ALLO_FALLBACK_DIRECT:-}
+      GATEWAY_DEBUG: ${GATEWAY_DEBUG:-false}
       PORT: 8000
     networks:
       - internal
@@ -126,7 +133,8 @@ services:
     depends_on:
       - redis
     environment:
-      YANDEX_API_KEY: ${YANDEX_SPEECHKIT_KEY:-}
+      # speech/src/main.py читает YC_API_KEY
+      YC_API_KEY: ${YANDEX_SPEECHKIT_KEY:-}
       REDIS_URL: redis://:${REDIS_PASSWORD:-allo_redis_pass}@redis:6379/0
       PORT: 8001
     networks:

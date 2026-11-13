@@ -1,7 +1,7 @@
 """Booking service REST API routes."""
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 from uuid import UUID, uuid4
@@ -180,7 +180,7 @@ async def get_slots(
 
     all_slots = []
     for day_offset in range(min(days, 14)):
-        d = target_date + __import__("datetime").timedelta(days=day_offset)
+        d = target_date + timedelta(days=day_offset)
         slots = await find_available_slots(
             db=db,
             tenant_id=tenant_id,
@@ -242,7 +242,7 @@ async def create_booking(
     start_at = body.start_at
     if start_at.tzinfo is None:
         start_at = start_at.replace(tzinfo=timezone.utc)
-    end_at = start_at.replace(tzinfo=timezone.utc) + __import__("datetime").timedelta(minutes=service.duration_min)
+    end_at = start_at.replace(tzinfo=timezone.utc) + timedelta(minutes=service.duration_min)
     start_at_utc = start_at.astimezone(timezone.utc)
     end_at_utc = end_at.astimezone(timezone.utc)
 
@@ -428,7 +428,7 @@ async def update_booking(
             select(ServiceORM.duration_min).where(ServiceORM.id == booking.service_id)
         )
         duration = svc_result.scalar_one_or_none() or 60
-        new_end = new_start + __import__("datetime").timedelta(minutes=duration)
+        new_end = new_start + timedelta(minutes=duration)
 
         has_conflict = await check_slot_conflict(
             db, tenant_id, body.master_id or booking.master_id,
@@ -450,8 +450,9 @@ async def update_booking(
         changes["new_master"] = str(body.master_id)
 
     if body.action == "update_service" and body.service_id:
-        booking.service_id = body.service_id
         changes["old_service"] = str(booking.service_id)
+        booking.service_id = body.service_id
+        changes["new_service"] = str(body.service_id)
 
     if body.action == "cancel":
         booking.status = "cancelled"
@@ -471,7 +472,7 @@ async def update_booking(
     return {
         "booking_id": str(booking.id),
         "status": booking.status,
-        "summary": f"Запись обновлена",
+        "summary": "Запись обновлена",
         "changes": changes,
     }
 
@@ -586,6 +587,7 @@ async def get_business_info(
         tenant_name=tenant.name,
         address=tenant.address,
         phone=tenant.phone,
+        # TODO: график зашит одинаковый для всех салонов — вынести в tenant
         work_hours={
             "mon-fri": "09:00-21:00",
             "sat": "10:00-20:00",

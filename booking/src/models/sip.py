@@ -3,9 +3,11 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint, event
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from shared.security import decrypt_value, encrypt_value
 
 from .base import Base
 
@@ -34,3 +36,14 @@ class SipSettingsORM(Base):
     )
 
     tenant = relationship("TenantORM", back_populates="sip_settings", foreign_keys=[tenant_id])
+
+    @property
+    def sip_password_plain(self) -> str | None:
+        """Расшифрованный пароль — использовать только при подключении к SIP."""
+        return decrypt_value(self.sip_password)
+
+
+@event.listens_for(SipSettingsORM, "before_insert")
+@event.listens_for(SipSettingsORM, "before_update")
+def _encrypt_sip_password(_mapper, _connection, target: SipSettingsORM) -> None:
+    target.sip_password = encrypt_value(target.sip_password)
