@@ -126,8 +126,13 @@ app = FastAPI(title="Алло — Voice Gateway", version="1.0.0", lifespan=life
 
 def _verify_signature(body: bytes, signature: str) -> bool:
     if not SIPUNI_SECRET:
-        logger.warning("SIPUNI_SECRET not set — signature check skipped")
-        return True
+        if GATEWAY_DEBUG:
+            logger.warning("SIPUNI_SECRET not set — signature check skipped (debug mode)")
+            return True
+        logger.error("SIPUNI_SECRET not set — rejecting webhook")
+        return False
+    if not signature:
+        return False
     expected = hmac.new(SIPUNI_SECRET.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
 
@@ -446,12 +451,18 @@ async def audio_relay(ws: WebSocket, session_id: str):
                 logger.exception("engine->client error session=%s", session_id)
                 stop.set()
 
-        await asyncio.gather(
-            _client_to_speech(),
-            _asr_to_engine(),
-            _vad_to_engine(),
-            _engine_to_client(),
-        )
+        tasks = [
+            asyncio.create_task(_client_to_speech()),
+            asyncio.create_task(_asr_to_engine()),
+            asyncio.create_task(_vad_to_engine()),
+            asyncio.create_task(_engine_to_client()),
+        ]
+        # Первая завершившаяся задача (разрыв/ошибка) останавливает остальные
+        _done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        stop.set()
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
     except Exception:
         logger.exception("audio relay setup failed session=%s", session_id)
